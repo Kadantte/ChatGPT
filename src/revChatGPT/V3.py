@@ -5,18 +5,36 @@ import argparse
 import json
 import os
 import sys
-from typing import AsyncGenerator, NoReturn
+from importlib.resources import path
+from pathlib import Path
+from typing import AsyncGenerator
+from typing import NoReturn
 
-import requests
 import httpx
+import requests
 import tiktoken
 
+from . import __version__
 from . import typings as t
 from .utils import create_completer
 from .utils import create_keybindings
 from .utils import create_session
 from .utils import get_filtered_keys_from_object
 from .utils import get_input
+
+ENGINES = [
+    "gpt-3.5-turbo",
+    "gpt-3.5-turbo-16k",
+    "gpt-3.5-turbo-0301",
+    "gpt-3.5-turbo-0613",
+    "gpt-3.5-turbo-16k-0613",
+    "gpt-4",
+    "gpt-4-0314",
+    "gpt-4-32k",
+    "gpt-4-32k-0314",
+    "gpt-4-0613",
+    "gpt-4-32k-0613",
+]
 
 
 class Chatbot:
@@ -36,6 +54,7 @@ class Chatbot:
         presence_penalty: float = 0.0,
         frequency_penalty: float = 0.0,
         reply_count: int = 1,
+        truncate_limit: int = None,
         system_prompt: str = "You are ChatGPT, a large language model trained by OpenAI. Respond conversationally",
     ) -> None:
         """
@@ -45,10 +64,22 @@ class Chatbot:
         self.api_key: str = api_key
         self.system_prompt: str = system_prompt
         self.max_tokens: int = max_tokens or (
-            31000 if engine == "gpt-4-32k" else 7000 if engine == "gpt-4" else 4000
+            31000
+            if "gpt-4-32k" in engine
+            else 7000
+            if "gpt-4" in engine
+            else 15000
+            if "gpt-3.5-turbo-16k" in engine
+            else 4000
         )
-        self.truncate_limit: int = (
-            30500 if engine == "gpt-4-32k" else 6500 if engine == "gpt-4" else 3500
+        self.truncate_limit: int = truncate_limit or (
+            30500
+            if "gpt-4-32k" in engine
+            else 6500
+            if "gpt-4" in engine
+            else 14500
+            if "gpt-3.5-turbo-16k" in engine
+            else 3500
         )
         self.temperature: float = temperature
         self.top_p: float = top_p
@@ -62,19 +93,22 @@ class Chatbot:
             {
                 "http": proxy,
                 "https": proxy,
-            }
+            },
         )
-        proxy = (
+        if proxy := (
             proxy or os.environ.get("all_proxy") or os.environ.get("ALL_PROXY") or None
-        )
-        if proxy:
+        ):
             if "socks5h" not in proxy:
                 self.aclient = httpx.AsyncClient(
-                    follow_redirects=True, proxies=proxy, timeout=timeout
+                    follow_redirects=True,
+                    proxies=proxy,
+                    timeout=timeout,
                 )
         else:
             self.aclient = httpx.AsyncClient(
-                follow_redirects=True, proxies=proxy, timeout=timeout
+                follow_redirects=True,
+                proxies=proxy,
+                timeout=timeout,
             )
 
         self.conversation: dict[str, list[dict]] = {
@@ -87,8 +121,7 @@ class Chatbot:
         }
 
         if self.get_token_count("default") > self.max_tokens:
-            error = t.ActionRefuseError("System prompt is too long")
-            raise error
+            raise t.ActionRefuseError("System prompt is too long")
 
     def add_to_conversation(
         self,
@@ -120,17 +153,10 @@ class Chatbot:
         """
         Get token count
         """
-        if self.engine not in [
-            "gpt-3.5-turbo",
-            "gpt-3.5-turbo-0301",
-            "gpt-4",
-            "gpt-4-0314",
-            "gpt-4-32k",
-            "gpt-4-32k-0314",
-        ]:
-            error = NotImplementedError("Unsupported engine {self.engine}")
-            raise error
-
+        if self.engine not in ENGINES:
+            raise NotImplementedError(
+                f"Engine {self.engine} is not supported. Select from {ENGINES}",
+            )
         tiktoken.model.MODEL_TO_ENCODING["gpt-4"] = "cl100k_base"
 
         encoding = tiktoken.encoding_for_model(self.engine)
@@ -140,7 +166,8 @@ class Chatbot:
             # every message follows <im_start>{role/name}\n{content}<im_end>\n
             num_tokens += 5
             for key, value in message.items():
-                num_tokens += len(encoding.encode(value))
+                if value:
+                    num_tokens += len(encoding.encode(value))
                 if key == "name":  # if there's a name, the role is omitted
                     num_tokens += 5  # role is always required and always 1 token
         num_tokens += 5  # every reply is primed with <im_start>assistant
@@ -157,6 +184,8 @@ class Chatbot:
         prompt: str,
         role: str = "user",
         convo_id: str = "default",
+        model: str = None,
+        pass_history: bool = True,
         **kwargs,
     ):
         """
@@ -168,12 +197,27 @@ class Chatbot:
         self.add_to_conversation(prompt, "user", convo_id=convo_id)
         self.__truncate_conversation(convo_id=convo_id)
         # Get response
+        if os.environ.get("API_URL") and os.environ.get("MODEL_NAME"):
+            # https://learn.microsoft.com/en-us/azure/cognitive-services/openai/chatgpt-quickstart?tabs=command-line&pivots=rest-api
+            url = (
+                os.environ.get("API_URL")
+                + "openai/deployments/"
+                + os.environ.get("MODEL_NAME")
+                + "/chat/completions?api-version=2023-05-15"
+            )
+            headers = {"Content-Type": "application/json", "api-key": self.api_key}
+        else:
+            url = (
+                os.environ.get("API_URL")
+                or "https://api.openai.com/v1/chat/completions"
+            )
+            headers = {"Authorization": f"Bearer {kwargs.get('api_key', self.api_key)}"}
         response = self.session.post(
-            os.environ.get("API_URL") or "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {kwargs.get('api_key', self.api_key)}"},
+            url,
+            headers=headers,
             json={
-                "model": self.engine,
-                "messages": self.conversation[convo_id],
+                "model": os.environ.get("MODEL_NAME") or model or self.engine,
+                "messages": self.conversation[convo_id] if pass_history else [prompt],
                 "stream": True,
                 # kwargs
                 "temperature": kwargs.get("temperature", self.temperature),
@@ -188,17 +232,19 @@ class Chatbot:
                 ),
                 "n": kwargs.get("n", self.reply_count),
                 "user": role,
-                "max_tokens": self.get_max_tokens(convo_id=convo_id),
+                "max_tokens": min(
+                    self.get_max_tokens(convo_id=convo_id),
+                    kwargs.get("max_tokens", self.max_tokens),
+                ),
             },
             timeout=kwargs.get("timeout", self.timeout),
             stream=True,
         )
         if response.status_code != 200:
-            error = t.APIConnectionError(
+            raise t.APIConnectionError(
                 f"{response.status_code} {response.reason} {response.text}",
             )
-            raise error
-        response_role: str = None
+        response_role: str or None = None
         full_response: str = ""
         for line in response.iter_lines():
             if not line:
@@ -227,6 +273,8 @@ class Chatbot:
         prompt: str,
         role: str = "user",
         convo_id: str = "default",
+        model: str = None,
+        pass_history: bool = True,
         **kwargs,
     ) -> AsyncGenerator[str, None]:
         """
@@ -243,8 +291,8 @@ class Chatbot:
             os.environ.get("API_URL") or "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {kwargs.get('api_key', self.api_key)}"},
             json={
-                "model": self.engine,
-                "messages": self.conversation[convo_id],
+                "model": model or self.engine,
+                "messages": self.conversation[convo_id] if pass_history else [prompt],
                 "stream": True,
                 # kwargs
                 "temperature": kwargs.get("temperature", self.temperature),
@@ -259,16 +307,18 @@ class Chatbot:
                 ),
                 "n": kwargs.get("n", self.reply_count),
                 "user": role,
-                "max_tokens": self.get_max_tokens(convo_id=convo_id),
+                "max_tokens": min(
+                    self.get_max_tokens(convo_id=convo_id),
+                    kwargs.get("max_tokens", self.max_tokens),
+                ),
             },
             timeout=kwargs.get("timeout", self.timeout),
         ) as response:
             if response.status_code != 200:
                 await response.aread()
-                error = t.APIConnectionError(
+                raise t.APIConnectionError(
                     f"{response.status_code} {response.reason_phrase} {response.text}",
                 )
-                raise error
 
             response_role: str = ""
             full_response: str = ""
@@ -281,6 +331,8 @@ class Chatbot:
                 if line == "[DONE]":
                     break
                 resp: dict = json.loads(line)
+                if "error" in resp:
+                    raise t.ResponseError(f"{resp['error']}")
                 choices = resp.get("choices")
                 if not choices:
                     continue
@@ -300,6 +352,8 @@ class Chatbot:
         prompt: str,
         role: str = "user",
         convo_id: str = "default",
+        model: str = None,
+        pass_history: bool = True,
         **kwargs,
     ) -> str:
         """
@@ -319,6 +373,8 @@ class Chatbot:
         prompt: str,
         role: str = "user",
         convo_id: str = "default",
+        model: str = None,
+        pass_history: bool = True,
         **kwargs,
     ) -> str:
         """
@@ -328,6 +384,8 @@ class Chatbot:
             prompt=prompt,
             role=role,
             convo_id=convo_id,
+            model=model,
+            pass_history=pass_history,
             **kwargs,
         )
         full_response: str = "".join(response)
@@ -367,7 +425,7 @@ class Chatbot:
                 indent=2,
             )
 
-    def load(self, file: str, *keys_: str) -> None:
+    def load(self, file: Path, *keys_: str) -> None:
         """
         Load the Chatbot configuration from a JSON file
         """
@@ -405,6 +463,10 @@ class Chatbot:
 
 
 class ChatbotCLI(Chatbot):
+    """
+    Command Line Interface for Chatbot
+    """
+
     def print_config(self, convo_id: str = "default") -> None:
         """
         Prints the current configuration
@@ -454,11 +516,11 @@ Examples:
   """,
         )
 
-    def handle_commands(self, input: str, convo_id: str = "default") -> bool:
+    def handle_commands(self, prompt: str, convo_id: str = "default") -> bool:
         """
         Handle chatbot commands
         """
-        command, *value = input.split(" ")
+        command, *value = prompt.split(" ")
         if command == "!help":
             self.print_help()
         elif command == "!exit":
@@ -505,9 +567,10 @@ def main() -> NoReturn:
     Main function
     """
     print(
-        """
+        f"""
     ChatGPT - Official ChatGPT API
     Repo: github.com/acheong08/ChatGPT
+    Version: {__version__}
     """,
     )
     print("Type '!help' to show a full list of commands")
@@ -577,19 +640,25 @@ def main() -> NoReturn:
         "--model",
         type=str,
         default="gpt-3.5-turbo",
-        choices=["gpt-3.5-turbo", "gpt-4", "gpt-4-32k"],
+        choices=ENGINES,
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--truncate_limit",
+        type=int,
+        default=None,
+    )
+
+    args, _ = parser.parse_known_args()
 
     # Initialize chatbot
     if config := args.config or os.environ.get("GPT_CONFIG_PATH"):
         chatbot = ChatbotCLI(args.api_key)
         try:
             chatbot.load(config)
-        except Exception:
+        except Exception as err:
             print(f"Error: {args.config} could not be loaded")
-            sys.exit()
+            raise err
     else:
         chatbot = ChatbotCLI(
             api_key=args.api_key,
@@ -599,13 +668,12 @@ def main() -> NoReturn:
             top_p=args.top_p,
             reply_count=args.reply_count,
             engine=args.model,
+            truncate_limit=args.truncate_limit,
         )
     # Check if internet is enabled
     if args.enable_internet:
-        from importlib.resources import path
-
         config = path("revChatGPT", "config").__str__()
-        chatbot.load(os.path.join(config, "enable_internet.json"), "conversation")
+        chatbot.load(Path(config, "enable_internet.json"), "conversation")
 
     session = create_session()
     completer = create_completer(
@@ -642,8 +710,12 @@ def main() -> NoReturn:
         if prompt.startswith("!"):
             try:
                 chatbot.handle_commands(prompt)
-            except Exception as e:
-                print(f"Error: {e}")
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ) as err:
+                print(f"Error: {err}")
+                continue
             continue
         print()
         print("ChatGPT: ", flush=True)
@@ -686,9 +758,8 @@ def main() -> NoReturn:
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
-        error = t.CLIError("Command line program unknown error")
-        raise error from e
+    except Exception as exc:
+        raise t.CLIError("Command line program unknown error") from exc
     except KeyboardInterrupt:
         print("\nExiting...")
         sys.exit()
